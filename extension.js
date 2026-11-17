@@ -755,7 +755,111 @@ function activateProject(context, root, projectCount, reproductionReports) {
 			activeContinuousRunCancel = cancelActiveRunForChange;
 		}
 
+		function isRequested(item) {
+			if (!request.include?.length) {
+				return true;
+			}
+			for (let node = item; node; node = node.parent) {
+				if (request.include.includes(node)) {
+					return true;
+				}
+			}
+			return false;
+		}
+
+		function findRequestedTest(relativePath, methodName) {
+			for (const fileItem of collectionItems(controller.items)) {
+				for (const test of descendantTests(fileItem)) {
+					const metadata = testData.get(test.id);
+					if (metadata?.relativePath === relativePath && metadata.methodName === methodName) {
+						return isRequested(test) ? test : null;
+					}
+				}
+			}
+			return null;
+		}
+
+		// Marks tests as started and provisionally passed or failed while GUT is still running.
+		// The final results.xml report still sets the definitive state and messages.
+		function createLiveTestReporter() {
+			let buffer = "";
+			let currentPath = null;
+			let currentTest = null;
+			let currentStatus = null;
+
+			function finishCurrent() {
+				currentTest = null;
+				currentStatus = null;
+			}
+
+			function passCurrent() {
+				if (currentTest && currentStatus === null) {
+					currentStatus = "pass";
+					run.passed(currentTest);
+				}
+			}
+
+			function handleLine(line) {
+				const fileMatch = /^res:\/\/(\S+\.gd)\s*$/.exec(line);
+				if (fileMatch) {
+					passCurrent();
+					finishCurrent();
+					currentPath = fileMatch[1];
+					return;
+				}
+				const testMatch = /^\* (\S+)\s*$/.exec(line);
+				if (testMatch) {
+					passCurrent();
+					finishCurrent();
+					currentTest = currentPath ? findRequestedTest(currentPath, testMatch[1]) : null;
+					if (currentTest) {
+						run.started(currentTest);
+					}
+					return;
+				}
+				if (/^\d+\/\d+ passed\.\s*$/.test(line)) {
+					passCurrent();
+					finishCurrent();
+					return;
+				}
+				if (/^(=|-{3,}\s*$|Totals|Scripts\b)/.test(line)) {
+					finishCurrent();
+					return;
+				}
+				const resultMatch = /^\s+\[(Passed|Failed)\]/.exec(line);
+				if (resultMatch && currentTest) {
+					if (resultMatch[1] === "Failed" && currentStatus !== "fail") {
+						currentStatus = "fail";
+						run.failed(currentTest, new vscode.TestMessage("Failed. Final details follow when the run ends."));
+					} else if (resultMatch[1] === "Passed" && currentStatus === null) {
+						currentStatus = "pass";
+						run.passed(currentTest);
+					}
+				}
+			}
+
+			return {
+				onOutput(text) {
+					buffer += text;
+					let newline = buffer.indexOf("\n");
+					while (newline >= 0) {
+						handleLine(buffer.slice(0, newline).replace(/\r$/, ""));
+						buffer = buffer.slice(newline + 1);
+						newline = buffer.indexOf("\n");
+					}
+				},
+				flush() {
+					if (buffer) {
+						handleLine(buffer.replace(/\r$/, ""));
+						buffer = "";
+					}
+					finishCurrent();
+				}
+			};
+		}
+
 		async function invokeSelection(relativePath, methodName, innerClassName = "") {
+			const liveReporter = createLiveTestReporter();
 			if (debugMode) {
 				run.appendOutput(
 					"Starting GUT through Godot Tools. Engine output is available in the Debug Console; cancel the test run to stop it.\r\n"
@@ -773,10 +877,11 @@ function activateProject(context, root, projectCount, reproductionReports) {
 					(output, location) => {
 						observeVersions(output);
 						run.appendOutput(escapeOutput(output), location);
+						liveReporter.onOutput(output);
 					}
-				);
+				).finally(() => liveReporter.flush());
 			}
-			return invokeGut(
+			const result = await invokeGut(
 				root.uri.fsPath,
 				config,
 				relativePath,
@@ -790,8 +895,11 @@ function activateProject(context, root, projectCount, reproductionReports) {
 				(output) => {
 					observeVersions(output);
 					run.appendOutput(escapeOutput(output));
-				}
+				},
+				(output) => liveReporter.onOutput(output)
 			);
+			liveReporter.flush();
+			return result;
 		}
 
 		const observedVersions = { godot: null, gut: null };
@@ -1537,7 +1645,8 @@ function activateProject(context, root, projectCount, reproductionReports) {
 		rendered,
 		setProcess,
 		token,
-		onOutput
+		onOutput,
+		onRawOutput
 	) {
 		const godotPath = await resolveGodotPath(root);
 		const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "gut-test-provider-"));
@@ -1574,7 +1683,8 @@ function activateProject(context, root, projectCount, reproductionReports) {
 				token,
 				setProcess,
 				onOutput,
-				gutConfig.environment
+				gutConfig.environment,
+				onRawOutput
 			);
 			const testCases = fs.existsSync(reportPath)
 				? parseJUnit(fs.readFileSync(reportPath, "utf8"))
@@ -1897,7 +2007,7 @@ function activateProject(context, root, projectCount, reproductionReports) {
 		);
 	}
 
-	function runProcess(executable, args, cwd, timeoutSeconds, token, setProcess, onOutput, environment) {
+	function runProcess(executable, args, cwd, timeoutSeconds, token, setProcess, onOutput, environment, onRawOutput) {
 		return new Promise((resolve, reject) => {
 			const processHandle = childProcess.spawn(executable, args, {
 				cwd,
@@ -1914,6 +2024,7 @@ function activateProject(context, root, projectCount, reproductionReports) {
 				if (!text) {
 					return;
 				}
+				onRawOutput?.(text);
 				output += text;
 				if (output.length > OUTPUT_LIMIT) {
 					output = output.slice(-OUTPUT_LIMIT);

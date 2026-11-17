@@ -77,6 +77,7 @@ function createHarness({
 	failure = false,
 	failureText = "Example assertion failure",
 	hang = false,
+	streamedOutput = null,
 	extraCases = false,
 	timeoutSeconds = 30,
 	breakOnFailure = true,
@@ -344,7 +345,9 @@ function createHarness({
 		handle.stderr = new EventEmitter();
 		handle.kill = () => handle.emit("close", null, "SIGTERM");
 		if (hang) {
-			queueMicrotask(() => handle.stdout.emit("data", Buffer.from("GUT is waiting\n")));
+			queueMicrotask(() =>
+				handle.stdout.emit("data", Buffer.from(streamedOutput ?? "GUT is waiting\n"))
+			);
 			return handle;
 		}
 		queueMicrotask(() => {
@@ -760,6 +763,46 @@ test("process output is streamed while a run is still active", async () => {
 	assert.ok(
 		harness.outputs.some((output) => output.text.includes("GUT is waiting")),
 		"Live Godot output should reach the Test Explorer before the process exits."
+	);
+	harness.cancel();
+	await pending;
+});
+
+test("completed tests are reported before the GUT process exits", async () => {
+	const streamedOutput = `res://tests/test_sample.gd\n* ${sampleMethod}\n\t[Passed] assert_true\n`;
+	const harness = createHarness({ hang: true, streamedOutput });
+	const pending = harness.run("Rendered", "test");
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.ok(
+		harness.results.some((result) => result.status === "passed" && result.id.endsWith(sampleMethod)),
+		"A test that GUT has reported as passed should update Test Explorer while the run is active."
+	);
+	harness.cancel();
+	await pending;
+});
+
+test("tests are reported passed from GUT's console summary without per-assert lines", async () => {
+	const streamedOutput = `res://tests/test_sample.gd\n* ${sampleMethod}\n1/1 passed.\n`;
+	const harness = createHarness({ hang: true, streamedOutput });
+	const pending = harness.run("Headless", "test");
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.ok(
+		harness.results.some((result) => result.status === "passed" && result.id.endsWith(sampleMethod)),
+		"A test followed by GUT's per-file summary should be reported before the process exits."
+	);
+	harness.cancel();
+	await pending;
+});
+
+test("live results are reported after output exceeds the display limit", async () => {
+	const filler = "x".repeat(100001) + "\n";
+	const streamedOutput = `${filler}res://tests/test_sample.gd\n* ${sampleMethod}\n\t[Passed] assert_true\n`;
+	const harness = createHarness({ hang: true, streamedOutput });
+	const pending = harness.run("Rendered", "test");
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.ok(
+		harness.results.some((result) => result.status === "passed" && result.id.endsWith(sampleMethod)),
+		"Live results should not stop when the displayed output reaches its limit."
 	);
 	harness.cancel();
 	await pending;
