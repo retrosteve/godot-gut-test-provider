@@ -1,0 +1,92 @@
+{
+  "name": "godot-gut-test-provider",
+  "displayName": "GUT Test Explorer",
+  "description": "Discovers and runs GUT tests in the VS Code Test Explorer.",
+  "version": "0.1.12",
+  "publisher": "retrosteve",
+  "files": [
+    "extension.js",
+    "package.json"
+  ],
+  "license": "UNLICENSED",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Testing"
+  ],
+  "activationEvents": [
+    "workspaceContains:addons/gut/gut_cmdln.gd"
+  ],
+  "main": "./extension.js",
+  "scripts": {
+    "test": "node --test extension.test.js"
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "gutTestProvider.exportReproductionReport",
+        "title": "GUT Test Explorer: Export Last Failure Report"
+      }
+    ],
+    "configuration": {
+      "title": "GUT Test Explorer",
+      "properties": {
+        "gutTestProvider.godotPath": {
+          "type": "string",
+          "default": "",
+          "description": "Optional Godot executable path. Defaults to the GUT extension override or Godot Tools path."
+        },
+        "gutTestProvider.timeoutSeconds": {
+          "type": "number",
+          "default": 120,
+          "minimum": 1,
+          "description": "Maximum time allowed for a non-debug GUT test invocation."
+        },
+        "gutTestProvider.repeatFailedCount": {
+          "type": "integer",
+          "default": 3,
+          "minimum": 2,
+          "maximum": 20,
+          "description": "Number of attempts made by the Repeat Failed profile."
+        },
+        "gutTestProvider.breakOnFailure": {
+          "type": "boolean",
+          "default": true,
+          "description": "Pause the Debug profile at GUT's first assertion failure."
+        },
+        "gutTestProvider.breakOnEveryFailure": {
+          "type": "boolean",
+          "default": false,
+          "description": "Keep the automatic GUT failure breakpoint active after the first hit."
+        },
+        "gutTestProvider.openFailureLocation": {
+          "type": "boolean",
+          "default": true,
+          "description": "Open the project source location when the debugger pauses on a GUT failure or Godot runtime error."
+        },
+        "gutTestProvider.stopOnErrors": {
+          "type": "boolean",
+          "default": false,
+          "description": "Report and navigate to Godot runtime errors when the debugger pauses for an exception."
+        },
+        "gutTestProvider.additionalArguments": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Additional Godot or GUT command-line arguments for each run."
+        },
+        "gutTestProvider.environment": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "description": "Environment variables applied to the Godot process."
+        }
+      }
+    }
+  }
+}
