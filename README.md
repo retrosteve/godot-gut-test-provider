@@ -72,9 +72,18 @@ particular game project.
   temporary launcher so the Godot Tools debugger inherits the configured
   values without embedding referenced secret values in the launcher.
 
-The Test Explorer provides **Headless** and **Rendered** run profiles, plus a
-**Debug** profile that launches GUT through Godot Tools so GDScript breakpoints
-are available. Headless and Rendered runs stream Godot output into the test run
+The Test Explorer provides **Continuous**, **Headless**, and **Rendered** run
+profiles, plus a **Debug** profile that launches GUT through Godot Tools so
+GDScript breakpoints are available. Continuous runs rerun the selected tests
+after project GDScript files change, with a short debounce. A change cancels an
+active stale invocation before the updated selection is run; cancel the run to
+stop watching. Test-file nodes are discovered up front, while test methods are
+loaded when a file is expanded or run. GUT inner test classes appear as suite
+nodes under their file; the provider recognizes `.gutconfig.json`'s
+`inner_class_prefix` (default `Test`) and passes `-ginner_class` when an inner
+class or one of its methods is selected. Refreshes update only changed test
+files.
+Headless and Rendered runs stream Godot output into the test run
 while it is executing. Failure locations use file-and-line information from GUT
 when available, falling back to the test file when GUT reports only a line.
 Debug runs do not time out while stopped at a breakpoint; cancel the test run
@@ -90,6 +99,10 @@ failures report the `params[n]` iteration labels GUT provides, but GUT 9.5
 aggregates iterations into one testcase and does not support selecting a single
 iteration.
 
+Use a run profile's **Configure** action to open the provider settings. Startup
+and parse errors that include a project-local GDScript path and line are linked
+to that source location in the Test Explorer.
+
 **Repeat Failed** runs the most recent failures the configured number of times.
 The final result remains failed if any attempt fails, and the output identifies
 flaky results and shows each attempt's outcome. **GUT Test Explorer: Export
@@ -99,3 +112,6 @@ and GUT versions, and a generic command-argument template. It omits raw output,
 configured argument values, environment values, and absolute project paths.
 When GUT's failure text uses recognizable `Expected` and `Actual` labels, those
 values are also exposed as structured VS Code test-message details.
+
+Each GUT project in a multi-root workspace receives its own Test Explorer
+controller and persisted failed-test state.

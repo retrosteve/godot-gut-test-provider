@@ -53,6 +53,26 @@ function collection() {
 	return items;
 }
 
+function enumerateTestItems(file) {
+	const items = [];
+	const visit = (children, innerClassName = "") => {
+		for (const item of children.values()) {
+			if (item.id.startsWith("suite:")) {
+				visit(item.children, item.label);
+			} else if (item.id.startsWith("test:")) {
+				items.push({
+					item,
+					classname: `${file.id.slice("file:".length)}${
+						innerClassName ? `.${innerClassName}` : ""
+					}`
+				});
+			}
+		}
+	};
+	visit(file.children);
+	return items;
+}
+
 function createHarness({
 	failure = false,
 	failureText = "Example assertion failure",
@@ -77,7 +97,11 @@ function createHarness({
 	environmentForReport = {},
 	additionalArgumentsForReport = [],
 	reportPath = path.join(os.tmpdir(), `gut-test-provider-report-${process.pid}.json`),
-	versionOutput = ""
+	versionOutput = "",
+	additionalProject = false,
+	innerClassSource = "",
+	innerClassPrefix = "Test",
+	startupError = ""
 } = {}) {
 	const profiles = [];
 	const launches = [];
@@ -95,9 +119,19 @@ function createHarness({
 	const debugTerminationListeners = [];
 	const cancelListeners = [];
 	const commandHandlers = new Map();
+	const controllers = [];
+	const fileWatchers = [];
 	fs.writeFileSync(
 		path.join(projectPath, sampleFile),
-		`${testLinePrefix}extends GutTest\n\nfunc ${sampleMethod}() -> void:\n\tassert_true(true)\n\nfunc ${secondMethod}() -> void:\n\tassert_true(true)\n`
+		`${testLinePrefix}extends GutTest\n\nfunc ${sampleMethod}() -> void:\n\tassert_true(true)\n\nfunc ${secondMethod}() -> void:\n\tassert_true(true)\n${innerClassSource}`
+	);
+	fs.writeFileSync(
+		path.join(projectPath, ".gutconfig.json"),
+		JSON.stringify({
+			dirs: ["res://tests"],
+			include_subdirs: true,
+			inner_class_prefix: innerClassPrefix
+		})
 	);
 	const token = {
 		isCancellationRequested: false,
@@ -108,16 +142,25 @@ function createHarness({
 	};
 	const disposable = () => ({ dispose() {} });
 	fs.writeFileSync(path.join(projectPath, "addons", "gut", "test.gd"), failureSource);
-	const controller = {
-		items: collection(),
-		dispose() {},
-		createRunProfile(label, kind, callback, isDefault) {
-			profiles.push({ label, kind, callback, isDefault });
-		},
-		createTestItem(id, label, uri) {
-			return { id, label, uri, children: collection() };
-		},
-		createTestRun() {
+	function createController() {
+		return {
+			items: collection(),
+			dispose() {},
+			createRunProfile(label, kind, callback, isDefault) {
+				const profile = { label, kind, callback, isDefault };
+				profiles.push(profile);
+				return profile;
+			},
+			createTestItem(id, label, uri) {
+				const item = { id, label, children: collection() };
+				Object.defineProperty(item, "uri", {
+					value: uri,
+					enumerable: true,
+					writable: false
+				});
+				return item;
+			},
+			createTestRun() {
 			const run = {
 				started(item) {
 					started.push(item);
@@ -131,10 +174,42 @@ function createHarness({
 				run[status] = (item, message) => results.push({ id: item.id, status, message });
 			}
 			return run;
+			}
 		}
 	};
+	const controller = createController();
+	controllers.push(controller);
+	if (additionalProject) {
+		const secondProjectPath = path.join(projectPath, "additional-project");
+		fs.mkdirSync(path.join(secondProjectPath, "addons", "gut"), { recursive: true });
+		fs.mkdirSync(path.join(secondProjectPath, "tests"), { recursive: true });
+		fs.writeFileSync(path.join(secondProjectPath, "project.godot"), "config_version=5\n");
+		fs.writeFileSync(
+			path.join(secondProjectPath, "addons", "gut", "gut_cmdln.gd"),
+			"extends SceneTree\n"
+		);
+		fs.writeFileSync(
+			path.join(secondProjectPath, ".gutconfig.json"),
+			JSON.stringify({ dirs: ["res://tests"] })
+		);
+		fs.writeFileSync(
+			path.join(secondProjectPath, sampleFile),
+			`extends GutTest\n\nfunc ${sampleMethod}() -> void:\n\tassert_true(true)\n`
+		);
+		const secondController = createController();
+		secondController.rootPath = secondProjectPath;
+		controllers.push(secondController);
+	}
 	const vscode = {
-		tests: { createTestController: () => controller },
+		tests: {
+			createTestController(id, label) {
+				const created = controllers.shift() ?? createController();
+				created.id = id;
+				created.label = label;
+				controllers.push(created);
+				return created;
+			}
+		},
 		TestRunProfileKind: { Run: 1, Debug: 2 },
 		SourceBreakpoint: class {
 			constructor(location) {
@@ -182,7 +257,13 @@ function createHarness({
 			}
 		},
 		workspace: {
-			workspaceFolders: [{ uri: { fsPath: projectPath } }],
+			workspaceFolders: [
+				{ uri: { fsPath: projectPath } },
+				...(additionalProject
+					? [{ uri: { fsPath: path.join(projectPath, "additional-project") } }]
+					: [])
+			],
+			textDocuments: [],
 			workspaceState: {
 				get(key, fallback) {
 					return workspaceState.has(key) ? workspaceState.get(key) : fallback;
@@ -225,21 +306,35 @@ function createHarness({
 				}
 			}),
 			onDidChangeConfiguration: disposable,
-			createFileSystemWatcher: () => ({
-				onDidCreate() {},
-				onDidChange() {},
-				onDidDelete() {},
-				dispose() {}
-			})
+			createFileSystemWatcher: () => {
+				const watcher = {
+					onDidCreate(listener) {
+						this.created = listener;
+					},
+					onDidChange(listener) {
+						this.changed = listener;
+					},
+					onDidDelete(listener) {
+						this.deleted = listener;
+					},
+					dispose() {}
+				};
+				fileWatchers.push(watcher);
+				return watcher;
+			}
 		}
 	};
 	vscode.commands = {
 		registerCommand(name, callback) {
 			commandHandlers.set(name, callback);
 			return disposable();
+		},
+		executeCommand(name, ...args) {
+			outputs.push({ command: name, args });
 		}
 	};
 	vscode.window.showSaveDialog = async () => ({ fsPath: reportPath });
+	vscode.window.showQuickPick = async (choices) => choices[0];
 	vscode.window.showInformationMessage = async (message) => outputs.push({ text: message });
 	const spawn = (executable, args, options) => {
 		const launchNumber = launches.length;
@@ -253,7 +348,10 @@ function createHarness({
 			return handle;
 		}
 		queueMicrotask(() => {
-			handle.stdout.emit("data", Buffer.from("GUT output line\n"));
+			handle.stdout.emit(
+				"data",
+				Buffer.from(startupError || "GUT output line\n")
+			);
 			if (versionOutput) {
 				handle.stdout.emit("data", Buffer.from(`${versionOutput}\n`));
 			}
@@ -265,14 +363,14 @@ function createHarness({
 					]
 				: [];
 			for (const file of controller.items.values()) {
-				for (const item of file.children.values()) {
+				for (const { item, classname } of enumerateTestItems(file)) {
 					const sequence = resultStatusSequences[item.label];
 					const caseStatus =
 						sequence?.[Math.min(launchNumber, sequence.length - 1)] ??
 						resultStatuses[item.label] ??
 						(failure ? "fail" : args.includes("--headless") ? "pending" : "pass");
 					cases.push(
-						`<testcase name="${item.label}" classname="${file.id.slice("file:".length)}" status="${caseStatus}" time="0.01">` +
+						`<testcase name="${item.label}" classname="${classname}" status="${caseStatus}" time="0.01">` +
 						(caseStatus === "fail" ? `<failure>${failureText}</failure>` : "") +
 						(caseStatus === "pending"
 							? "<skipped message=\"pending\"><![CDATA[Requires rendering]]></skipped>"
@@ -282,7 +380,7 @@ function createHarness({
 				}
 			}
 			fs.writeFileSync(args[args.indexOf("-gjunit_xml_file") + 1], cases.join(""));
-			handle.emit("close", failure ? 1 : 0, null);
+			handle.emit("close", failure || startupError ? 1 : 0, null);
 		});
 		return handle;
 	};
@@ -406,10 +504,10 @@ function createHarness({
 				assert.ok(reportMatch, "Debug launch must include a JUnit report path.");
 				const cases = [];
 				for (const file of controller.items.values()) {
-					for (const item of file.children.values()) {
+					for (const { item, classname } of enumerateTestItems(file)) {
 						const caseStatus = resultStatuses[item.label] ?? "pass";
 						cases.push(
-							`<testcase name="${item.label}" classname="${file.id.slice("file:".length)}" status="${caseStatus}" time="0.01">` +
+							`<testcase name="${item.label}" classname="${classname}" status="${caseStatus}" time="0.01">` +
 								(caseStatus === "fail" ? `<failure>${failureText}</failure>` : "") +
 								"</testcase>"
 						);
@@ -456,6 +554,8 @@ function createHarness({
 	sandbox.module.exports.activate(context);
 	return {
 		profiles,
+		controllers,
+		fileWatchers,
 		launches,
 		debugConfigurations,
 		debugLauncherContents,
@@ -465,6 +565,7 @@ function createHarness({
 		workspaceState,
 		reportPath,
 		commandHandlers,
+		cancelListeners,
 		results,
 		errors,
 		outputs,
@@ -479,6 +580,7 @@ function createHarness({
 		async run(profileName, selection) {
 			const file = controller.items.get(`file:${sampleFile}`);
 			assert.ok(file, "The provider must discover the sample test file.");
+			await controller.resolveHandler(file);
 			const method = [...file.children.values()].find((item) => item.label === sampleMethod);
 			assert.ok(method, "The provider must discover the selected test.");
 			const include = selection === "all" ? undefined : [selection === "file" ? file : method];
@@ -502,8 +604,54 @@ function createHarness({
 test("test items point at their func line", async () => {
 	const harness = createHarness();
 	const file = harness.controller.items.get(`file:${sampleFile}`);
+	assert.equal(file.children.size, 0, "Test methods should be discovered on demand.");
+	await harness.controller.resolveHandler(file);
 	const method = [...file.children.values()].find((item) => item.label === sampleMethod);
 	assert.equal(method.range.start.line, 2, "The range should start on the func line (0-based).");
+});
+
+test("run profile configuration opens the provider settings", async () => {
+	const harness = createHarness();
+	for (const profile of harness.profiles) {
+		assert.equal(typeof profile.configureHandler, "function");
+		await profile.configureHandler();
+	}
+	assert.equal(
+		harness.outputs.filter(
+			(output) =>
+				output.command === "workbench.action.openSettings" &&
+				output.args[0] === "@ext:retrosteve.godot-gut-test-provider"
+		).length,
+		harness.profiles.length
+	);
+});
+
+test("test IDs remain stable when methods move and unchanged items are reused", async () => {
+	const harness = createHarness();
+	const file = harness.controller.items.get(`file:${sampleFile}`);
+	await harness.controller.resolveHandler(file);
+	const original = [...file.children.values()].find((item) => item.label === sampleMethod);
+	fs.writeFileSync(
+		path.join(projectPath, sampleFile),
+		`# moved\n# moved again\nextends GutTest\n\nfunc ${sampleMethod}() -> void:\n\tassert_true(true)\n`
+	);
+	await harness.controller.refreshHandler();
+	const moved = [...file.children.values()].find((item) => item.label === sampleMethod);
+	assert.equal(moved.id, original.id);
+	assert.equal(moved.range.start.line, 4);
+});
+
+test("multi-root workspaces create isolated controllers for each GUT project", async () => {
+	const harness = createHarness({ additionalProject: true });
+	assert.equal(harness.controllers.length, 2);
+	assert.notEqual(harness.controllers[0].id, harness.controllers[1].id);
+	assert.notEqual(harness.controllers[0].label, harness.controllers[1].label);
+	for (const controller of harness.controllers) {
+		const file = controller.items.get(`file:${sampleFile}`);
+		assert.ok(file);
+		await controller.resolveHandler(file);
+		assert.ok([...file.children.values()].some((item) => item.label === sampleMethod));
+	}
 });
 
 test("skipped tests report the GUT pending reason", async () => {
@@ -552,6 +700,42 @@ test("results are matched by file as well as test name", async () => {
 	assert.equal(result.status, "passed", result.message?.message);
 });
 
+test("inner test classes are selectable and their JUnit results are matched", async () => {
+	const innerMethod = "test_nested_passes";
+	const harness = createHarness({
+		innerClassPrefix: "Spec",
+		innerClassSource: `class SpecNested:\n\textends GutTest\n\tfunc ${innerMethod}() -> void:\n\t\tassert_true(true)\n`
+	});
+	const file = harness.controller.items.get(`file:${sampleFile}`);
+	await harness.controller.resolveHandler(file);
+	const suite = [...file.children.values()].find((item) => item.id.startsWith("suite:"));
+	assert.ok(suite, "The configured GUT inner-class prefix should create a suite.");
+	const method = [...suite.children.values()].find((item) => item.label === innerMethod);
+	assert.ok(method, "Methods inside a GUT inner class should be discovered.");
+
+	await harness.runRequest("Rendered", { include: [suite] });
+
+	const result = harness.results.find((item) => item.id === method.id);
+	assert.equal(result.status, "passed", result.message?.message);
+	const args = harness.launches[0].args;
+	const innerClassArgument = args.indexOf("-ginner_class");
+	assert.notEqual(innerClassArgument, -1, "The selected inner class must be passed to GUT.");
+	assert.equal(args[innerClassArgument + 1], "SpecNested");
+});
+
+test("GUT startup errors link to source locations inside the project", async () => {
+	const sourceLocation = `res://${sampleFile}:3`;
+	const harness = createHarness({
+		startupError: `SCRIPT ERROR: Parse Error at ${sourceLocation}\n`
+	});
+
+	const result = await harness.run("Rendered", "test");
+
+	assert.equal(result.status, "errored");
+	assert.equal(result.message.location.uri.fsPath, path.join(projectPath, sampleFile));
+	assert.equal(result.message.location.range.start.line, 2);
+});
+
 test("Godot timeouts are reported as errors", async () => {
 	const harness = createHarness({ hang: true, timeoutSeconds: 1 });
 	const result = await harness.run("Rendered", "test");
@@ -584,6 +768,7 @@ test("process output is streamed while a run is still active", async () => {
 test("excluded tests are not run when their containing file is selected", async () => {
 	const harness = createHarness();
 	const file = harness.controller.items.get(`file:${sampleFile}`);
+	await harness.controller.resolveHandler(file);
 	const methods = [...file.children.values()];
 	const excluded = methods.find((item) => item.label === secondMethod);
 	const selected = methods.find((item) => item.label === sampleMethod);
@@ -795,6 +980,82 @@ test("Repeat Failed reports invalid repetition counts", async () => {
 	assert.ok(
 		harness.errors.some((message) => message.includes("must be an integer from 2 to 20"))
 	);
+});
+
+test("Continuous profile reruns selected tests after project GDScript changes", async () => {
+	const harness = createHarness();
+	const profile = harness.profiles.find((candidate) => candidate.label === "Continuous");
+	assert.equal(profile.supportsContinuousRun, true);
+	const file = harness.controller.items.get(`file:${sampleFile}`);
+	await harness.controller.resolveHandler(file);
+	const method = [...file.children.values()].find((item) => item.label === sampleMethod);
+	const continuousToken = {
+		isCancellationRequested: false,
+		onCancellationRequested(listener) {
+			harness.cancelListeners.push(listener);
+			return { dispose() {} };
+		}
+	};
+	const pending = profile.callback(
+		{ include: [method], continuous: true },
+		continuousToken
+	);
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	assert.equal(harness.launches.length, 1);
+	fs.writeFileSync(
+		path.join(projectPath, sampleFile),
+		`# changed\nextends GutTest\n\nfunc ${sampleMethod}() -> void:\n\tassert_true(true)\n`
+	);
+	await harness.fileWatchers[0].changed({ fsPath: path.join(projectPath, sampleFile) });
+	await new Promise((resolve) => setTimeout(resolve, 450));
+	assert.equal(harness.launches.length, 2);
+	continuousToken.isCancellationRequested = true;
+	for (const listener of harness.cancelListeners) {
+		listener();
+	}
+	await pending;
+});
+
+test("Continuous changes cancel stale active runs before rerunning", async () => {
+	const harness = createHarness({ hang: true });
+	const profile = harness.profiles.find((candidate) => candidate.label === "Continuous");
+	const file = harness.controller.items.get(`file:${sampleFile}`);
+	await harness.controller.resolveHandler(file);
+	const method = [...file.children.values()].find((item) => item.label === sampleMethod);
+	const continuousListeners = [];
+	const continuousToken = {
+		isCancellationRequested: false,
+		onCancellationRequested(listener) {
+			continuousListeners.push(listener);
+			return { dispose() {} };
+		}
+	};
+	const pending = profile.callback(
+		{ include: [method], continuous: true },
+		continuousToken
+	);
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	assert.equal(harness.launches.length, 1);
+	fs.writeFileSync(
+		path.join(projectPath, sampleFile),
+		`# changed while running\nextends GutTest\n\nfunc ${sampleMethod}() -> void:\n\tassert_true(true)\n`
+	);
+	await harness.fileWatchers[0].changed({ fsPath: path.join(projectPath, sampleFile) });
+	for (let attempt = 0; attempt < 30 && harness.launches.length < 2; attempt += 1) {
+		await new Promise((resolve) => setTimeout(resolve, 50));
+	}
+	assert.equal(harness.launches.length, 2, "The changed selection should be run again.");
+	assert.ok(
+		harness.results.some(
+			(result) => result.id === method.id && result.status === "skipped"
+		),
+		"The cancelled stale run should not report an error or pass."
+	);
+	continuousToken.isCancellationRequested = true;
+	for (const listener of continuousListeners) {
+		listener();
+	}
+	await pending;
 });
 
 test("reproduction reports export generic test references without argument or environment values", async () => {
@@ -1064,6 +1325,7 @@ for (const profile of ["Headless", "Rendered"]) {
 			assert.deepEqual(
 				harness.profiles.map(({ label, isDefault }) => ({ label, isDefault })),
 				[
+					{ label: "Continuous", isDefault: false },
 					{ label: "Headless", isDefault: true },
 					{ label: "Rendered", isDefault: false },
 					{ label: "Debug", isDefault: false },

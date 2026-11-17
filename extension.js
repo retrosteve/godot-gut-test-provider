@@ -1,6 +1,7 @@
 "use strict";
 
 const childProcess = require("node:child_process");
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -13,16 +14,72 @@ const GUT_SCRIPT = "res://addons/gut/gut_cmdln.gd";
 const OUTPUT_LIMIT = 100000;
 
 function activate(context) {
-	const root = findGodotProject();
-	if (!root) {
+	const roots = findGodotProjects();
+	if (roots.length === 0) {
 		return;
 	}
+	const reproductionReports = new Map();
+	context.subscriptions.push(
+		vscode.commands.registerCommand("gutTestProvider.exportReproductionReport", async () => {
+			const availableReports = [...reproductionReports.values()];
+			if (availableReports.length === 0) {
+				await vscode.window.showInformationMessage(
+					"GUT Test Explorer: There is no failed test run to export."
+				);
+				return;
+			}
+			let selectedReport = availableReports[0];
+			if (availableReports.length > 1) {
+				const choice = await vscode.window.showQuickPick(
+					availableReports.map((entry) => ({
+						label: path.basename(entry.rootPath),
+						description: entry.rootPath,
+						entry
+					})),
+					{ placeHolder: "Choose the Godot project failure report to export" }
+				);
+				selectedReport = choice?.entry;
+				if (!selectedReport) {
+					return;
+				}
+			}
+			const saveUri = await vscode.window.showSaveDialog({
+				defaultUri: vscode.Uri.file(
+					path.join(selectedReport.rootPath, "gut-test-reproduction.json")
+				),
+				filters: { "JSON report": ["json"] }
+			});
+			if (!saveUri) {
+				return;
+			}
+			try {
+				fs.writeFileSync(
+					saveUri.fsPath,
+					`${JSON.stringify(selectedReport.report, null, 2)}\n`
+				);
+				await vscode.window.showInformationMessage(
+					`GUT Test Explorer: Reproduction report saved to ${saveUri.fsPath}`
+				);
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				await vscode.window.showErrorMessage(
+					`GUT Test Explorer: Could not save the reproduction report: ${message}`
+				);
+			}
+		})
+	);
+	for (const root of roots) {
+		activateProject(context, root, roots.length, reproductionReports);
+	}
+}
 
+function activateProject(context, root, projectCount, reproductionReports) {
 	function findTestByReference(reference) {
 		for (const [id, metadata] of testData) {
 			if (
 				metadata.kind === "test" &&
 				metadata.relativePath === reference.relativePath &&
+				(metadata.innerClassName ?? "") === (reference.innerClassName ?? "") &&
 				metadata.methodName === reference.methodName
 			) {
 				return findTestItem(id);
@@ -31,14 +88,29 @@ function activate(context) {
 		return null;
 	}
 
-	const controller = vscode.tests.createTestController(CONTROLLER_ID, CONTROLLER_LABEL);
+	const rootPath = path.resolve(root.uri.fsPath);
+	const rootHash = crypto.createHash("sha256").update(rootPath).digest("hex").slice(0, 12);
+	const controller = vscode.tests.createTestController(
+		`${CONTROLLER_ID}.${rootHash}`,
+		projectCount > 1
+			? `${CONTROLLER_LABEL} - ${path.basename(rootPath)}`
+			: CONTROLLER_LABEL
+	);
 	const testData = new Map();
 	let config = null;
 	let watchers = [];
 	let lastReproductionReport = null;
+	let pendingContinuousChange = null;
+	let continuousRunActive = false;
+	let continuousChangePending = false;
+	let activeContinuousRunCancel = null;
+	const projectStateKey = `godotGutTestProvider.lastFailedRun.${rootHash}`;
+	const defaultFailedRunState = { testIds: [], testRefs: [], rendered: false, debugMode: false };
 	const failedRunState = context.workspaceState.get(
-		"godotGutTestProvider.lastFailedRun",
-		{ testIds: [], testRefs: [], rendered: false, debugMode: false }
+		projectStateKey,
+		projectCount === 1
+			? context.workspaceState.get("godotGutTestProvider.lastFailedRun", defaultFailedRunState)
+			: defaultFailedRunState
 	) ?? { testIds: [], rendered: false, debugMode: false };
 	let lastFailedTestIds = Array.isArray(failedRunState.testIds)
 		? failedRunState.testIds.filter((id) => typeof id === "string")
@@ -56,68 +128,65 @@ function activate(context) {
 		debugMode: Boolean(failedRunState.debugMode)
 	};
 
-	controller.createRunProfile(
+	const continuousProfile = controller.createRunProfile(
+		"Continuous",
+		vscode.TestRunProfileKind.Run,
+		(request, token) => runTests(request, token, false),
+		false
+	);
+	continuousProfile.supportsContinuousRun = true;
+	configureRunProfile(continuousProfile);
+	const headlessProfile = controller.createRunProfile(
 		"Headless",
 		vscode.TestRunProfileKind.Run,
 		(request, token) => runTests(request, token, false),
 		true
 	);
-	controller.createRunProfile(
+	configureRunProfile(headlessProfile);
+	const renderedProfile = controller.createRunProfile(
 		"Rendered",
 		vscode.TestRunProfileKind.Run,
 		(request, token) => runTests(request, token, true),
 		false
 	);
-	controller.createRunProfile(
+	configureRunProfile(renderedProfile);
+	const debugProfile = controller.createRunProfile(
 		"Debug",
 		vscode.TestRunProfileKind.Debug,
 		(request, token) => runTests(request, token, false, true),
 		false
 	);
-	controller.createRunProfile(
+	configureRunProfile(debugProfile);
+	const rerunProfile = controller.createRunProfile(
 		"Rerun Failed",
 		vscode.TestRunProfileKind.Run,
 		(request, token) => rerunFailedTests(request, token),
 		false
 	);
-	controller.createRunProfile(
+	configureRunProfile(rerunProfile);
+	const repeatProfile = controller.createRunProfile(
 		"Repeat Failed",
 		vscode.TestRunProfileKind.Run,
 		(request, token) => repeatFailedTests(request, token),
 		false
 	);
-	context.subscriptions.push(
-		vscode.commands.registerCommand("gutTestProvider.exportReproductionReport", async () => {
-			if (!lastReproductionReport) {
-				await vscode.window.showInformationMessage(
-					"GUT Test Explorer: There is no failed test run to export."
-				);
-				return;
-			}
-			const saveUri = await vscode.window.showSaveDialog({
-				defaultUri: vscode.Uri.file(
-					path.join(root.uri.fsPath, "gut-test-reproduction.json")
-				),
-				filters: { "JSON report": ["json"] }
-			});
-			if (!saveUri) {
-				return;
-			}
-			try {
-				fs.writeFileSync(saveUri.fsPath, `${JSON.stringify(lastReproductionReport, null, 2)}\n`);
-				await vscode.window.showInformationMessage(
-					`GUT Test Explorer: Reproduction report saved to ${saveUri.fsPath}`
-				);
-			} catch (error) {
-				const message = error instanceof Error ? error.message : String(error);
-				await vscode.window.showErrorMessage(
-					`GUT Test Explorer: Could not save the reproduction report: ${message}`
-				);
-			}
-		})
-	);
+	configureRunProfile(repeatProfile);
 
+	function configureRunProfile(profile) {
+		profile.configureHandler = () =>
+			vscode.commands.executeCommand(
+				"workbench.action.openSettings",
+				"@ext:retrosteve.godot-gut-test-provider"
+			);
+	}
 	controller.refreshHandler = async () => refreshTests();
+	controller.resolveHandler = async (item) => {
+		if (!item) {
+			await refreshTests();
+			return;
+		}
+		await resolveTestFile(item);
+	};
 	const debugTrackerFactory = vscode.debug.registerDebugAdapterTrackerFactory("godot", {
 		createDebugAdapterTracker(session) {
 			const trackerState = debugRunStates.get(session.name);
@@ -154,16 +223,32 @@ function activate(context) {
 	async function refreshTests() {
 		try {
 			config = loadGutConfig(root.uri.fsPath);
-			controller.items.replace([]);
-			testData.clear();
-
+			const discoveredFiles = new Set();
 			for (const testDirectory of config.directories) {
 				if (!isWithin(root.uri.fsPath, testDirectory)) {
 					continue;
 				}
-
 				for (const filePath of findTestFiles(testDirectory, config)) {
-					addTestFile(filePath);
+					const resolvedPath = path.resolve(filePath);
+					discoveredFiles.add(resolvedPath);
+					const relativePath = path.relative(root.uri.fsPath, resolvedPath)
+						.split(path.sep)
+						.join("/");
+					const fileItem = controller.items.get(`file:${relativePath}`);
+					if (!fileItem) {
+						addTestFile(resolvedPath);
+					} else {
+						const metadata = testData.get(fileItem.id);
+						if (metadata?.signature !== fileSignature(resolvedPath)) {
+							await resolveTestFile(fileItem, true);
+						}
+					}
+				}
+			}
+			for (const fileItem of collectionItems(controller.items)) {
+				const metadata = testData.get(fileItem.id);
+				if (metadata && !discoveredFiles.has(path.resolve(metadata.filePath))) {
+					removeTestFile(fileItem);
 				}
 			}
 		} catch (error) {
@@ -271,7 +356,6 @@ function activate(context) {
 	}
 
 	function addTestFile(filePath) {
-		const contents = fs.readFileSync(filePath, "utf8");
 		const relativePath = path.relative(root.uri.fsPath, filePath).split(path.sep).join("/");
 		const uri = vscode.Uri.file(filePath);
 		const fileItem = controller.createTestItem(
@@ -279,48 +363,200 @@ function activate(context) {
 			path.basename(filePath),
 			uri
 		);
-		fileItem.canResolveChildren = false;
-		testData.set(fileItem.id, { kind: "file", filePath, relativePath });
+		fileItem.canResolveChildren = true;
+		testData.set(fileItem.id, {
+			kind: "file",
+			filePath,
+			relativePath,
+			discovered: false,
+			signature: fileSignature(filePath)
+		});
+		controller.items.add(fileItem);
+		return fileItem;
+	}
 
-		const methodPattern = /^[ \t]*func[ \t]+(test_[A-Za-z0-9_]+)[ \t]*\(/gm;
-		let match;
-		while ((match = methodPattern.exec(contents)) !== null) {
-			const methodName = match[1];
-			const line = countLines(contents, match.index);
-			const testItem = controller.createTestItem(
-				`test:${relativePath}:${line}:${methodName}`,
-				methodName,
-				uri
+	async function resolveTestFile(fileItem, force = false) {
+		const fileMetadata = testData.get(fileItem.id);
+		if (fileMetadata?.kind !== "file" || (fileMetadata.discovered && !force)) {
+			return;
+		}
+		const document = vscode.workspace.textDocuments?.find(
+			(openDocument) => openDocument.uri.fsPath === fileMetadata.filePath
+		);
+		const contents = document?.getText() ?? fs.readFileSync(fileMetadata.filePath, "utf8");
+		const previousItems = new Map(
+			collectionItems(fileItem.children).map((child) => [child.id, child])
+		);
+		const currentItems = [];
+		const currentIds = new Set();
+		const uri = vscode.Uri.file(fileMetadata.filePath);
+		const lines = contents.split(/\r?\n/);
+		const classPattern = /^([ \t]*)class[ \t]+([A-Za-z_][A-Za-z0-9_]*)[ \t]*:/;
+		const methodPattern = /^[ \t]*func[ \t]+(test_[A-Za-z0-9_]+)[ \t]*\(/;
+		const innerClasses = [];
+		const rootMethods = [];
+		for (let index = 0; index < lines.length; index += 1) {
+			const match = classPattern.exec(lines[index]);
+			if (match) {
+				const classIndent = match[1].length;
+				let end = index + 1;
+				while (end < lines.length) {
+					const candidate = lines[end];
+					if (
+						candidate.trim().length > 0 &&
+						!candidate.trimStart().startsWith("#") &&
+						indentation(candidate) <= classIndent
+					) {
+						break;
+					}
+					end += 1;
+				}
+				const classBody = lines.slice(index + 1, end);
+				if (
+					match[2].startsWith(config.innerClassPrefix) &&
+					classBody.some((line) =>
+						/^[ \t]+extends[ \t]+(?:GutTest(?:[ \t]|$)|["']res:\/\/addons\/gut\/test\.gd["'](?:[ \t]|$))/.test(
+							line
+						)
+					)
+				) {
+					innerClasses.push({
+						name: match[2],
+						line: index,
+						indent: classIndent,
+						lines: classBody
+					});
+				}
+				index = end - 1;
+				continue;
+			}
+			const methodMatch = methodPattern.exec(lines[index]);
+			if (methodMatch && indentation(lines[index]) === 0) {
+				rootMethods.push({ name: methodMatch[1], line: index });
+			}
+		}
+
+		for (const method of rootMethods) {
+			currentItems.push(
+				createTestItem(fileMetadata, method.name, method.line, "", uri, previousItems, currentIds)
 			);
-			testItem.range = new vscode.Range(line, 0, line, 0);
-			testData.set(testItem.id, {
-				kind: "test",
-				filePath,
-				relativePath,
-				methodName,
-				line
+		}
+		for (const innerClass of innerClasses) {
+			const suiteId = `suite:${fileMetadata.relativePath}:${innerClass.name}`;
+			const suiteItem = previousItems.get(suiteId) ??
+				controller.createTestItem(suiteId, innerClass.name, uri);
+			suiteItem.range = new vscode.Range(innerClass.line, 0, innerClass.line, 0);
+			suiteItem.canResolveChildren = false;
+			const previousSuiteChildren = new Map(
+				collectionItems(suiteItem.children).map((child) => [child.id, child])
+			);
+			const classTestIds = new Set();
+			const classMethods = [];
+			for (let index = 0; index < innerClass.lines.length; index += 1) {
+				const methodMatch = methodPattern.exec(innerClass.lines[index]);
+				if (methodMatch && indentation(innerClass.lines[index]) > innerClass.indent) {
+					classMethods.push({
+						name: methodMatch[1],
+						line: innerClass.line + 1 + index
+					});
+				}
+			}
+			const suiteTests = classMethods.map((method) =>
+				createTestItem(
+					fileMetadata,
+					method.name,
+					method.line,
+					innerClass.name,
+					uri,
+					previousSuiteChildren,
+					classTestIds
+				)
+			);
+			for (const previousChild of previousSuiteChildren.values()) {
+				if (!classTestIds.has(previousChild.id)) {
+					testData.delete(previousChild.id);
+				}
+			}
+			suiteItem.children.replace(suiteTests);
+			if (!currentIds.has(suiteId)) {
+				currentIds.add(suiteId);
+			}
+			testData.set(suiteId, {
+				kind: "suite",
+				filePath: fileMetadata.filePath,
+				relativePath: fileMetadata.relativePath,
+				innerClassName: innerClass.name,
+				line: innerClass.line
 			});
-			fileItem.children.add(testItem);
+			currentItems.push(suiteItem);
 		}
+		for (const previousItem of previousItems.values()) {
+			if (
+				previousItem.id.startsWith(`suite:${fileMetadata.relativePath}:`) &&
+				!currentIds.has(previousItem.id)
+			) {
+				for (const child of collectionItems(previousItem.children)) {
+					testData.delete(child.id);
+				}
+			}
+			if (!currentIds.has(previousItem.id)) {
+				testData.delete(previousItem.id);
+			}
+		}
+		fileItem.children.replace(currentItems);
+		fileMetadata.discovered = true;
+		fileMetadata.signature = fileSignature(fileMetadata.filePath);
+	}
 
-		if (fileItem.children.size > 0) {
-			controller.items.add(fileItem);
+	function createTestItem(
+		fileMetadata,
+		methodName,
+		line,
+		innerClassName,
+		uri,
+		previousItems,
+		currentIds
+	) {
+		const classKey = innerClassName ? `${innerClassName}:` : "";
+		const testId = `test:${fileMetadata.relativePath}:${classKey}${methodName}`;
+		const testItem = previousItems.get(testId) ??
+			controller.createTestItem(testId, methodName, uri);
+		testItem.range = new vscode.Range(line, 0, line, 0);
+		currentIds.add(testId);
+		testData.set(testId, {
+			kind: "test",
+			filePath: fileMetadata.filePath,
+			relativePath: fileMetadata.relativePath,
+			innerClassName,
+			methodName,
+			line
+		});
+		return testItem;
+	}
+
+	function indentation(line) {
+		return line.match(/^[ \t]*/)[0].length;
+	}
+
+	function removeTestFile(fileItem) {
+		deleteTestTree(fileItem);
+		controller.items.delete(fileItem.id);
+	}
+
+	function deleteTestTree(item) {
+		for (const child of collectionItems(item.children)) {
+			deleteTestTree(child);
 		}
+		testData.delete(item.id);
 	}
 
 	async function rerunFailedTests(request, token) {
-		const failedTests = lastFailedTestRefs.length > 0
-			? lastFailedTestRefs.map(findTestByReference).filter((item) => item !== null)
-			: lastFailedTestIds.map((id) => findTestItem(id))
-			.filter((item) => item !== null);
+		const failedTests = await resolveFailedTestItems();
 		await runFailedTests(request, token, failedTests, 1);
 	}
 
 	async function repeatFailedTests(request, token) {
-		const failedTests = lastFailedTestRefs.length > 0
-			? lastFailedTestRefs.map(findTestByReference).filter((item) => item !== null)
-			: lastFailedTestIds.map((id) => findTestItem(id))
-			.filter((item) => item !== null);
+		const failedTests = await resolveFailedTestItems();
 		const repeatCount = vscode.workspace
 			.getConfiguration("gutTestProvider", root.uri)
 			.get("repeatFailedCount", 3);
@@ -331,6 +567,24 @@ function activate(context) {
 			return;
 		}
 		await runFailedTests(request, token, failedTests, repeatCount);
+	}
+
+	async function resolveFailedTestItems() {
+		if (lastFailedTestRefs.length === 0) {
+			return lastFailedTestIds
+				.map((id) => findTestItem(id))
+				.filter((item) => item !== null);
+		}
+		await refreshTests();
+		for (const reference of lastFailedTestRefs) {
+			const fileItem = controller.items.get(`file:${reference.relativePath}`);
+			if (fileItem) {
+				await resolveTestFile(fileItem);
+			}
+		}
+		return lastFailedTestRefs
+			.map(findTestByReference)
+			.filter((item) => item !== null);
 	}
 
 	async function runFailedTests(request, token, failedTests, repeatCount) {
@@ -394,20 +648,86 @@ function activate(context) {
 			if (file.id === id) {
 				return file;
 			}
-			for (const test of collectionItems(file.children)) {
-				if (test.id === id) {
-					return test;
+			const pending = collectionItems(file.children);
+			while (pending.length > 0) {
+				const item = pending.pop();
+				if (item.id === id) {
+					return item;
 				}
+				pending.push(...collectionItems(item.children));
 			}
 		}
 		return null;
 	}
 
 	async function runTests(request, token, rendered, debugMode = false, repeatCount = 1) {
+		if (!request.continuous) {
+			await runTestsOnce(request, token, rendered, debugMode, repeatCount);
+			return;
+		}
+		continuousRunActive = true;
+		try {
+			while (!token.isCancellationRequested) {
+				await runTestsOnce(request, token, rendered, debugMode, repeatCount);
+				if (token.isCancellationRequested) {
+					break;
+				}
+				const changed = await waitForContinuousChange(token);
+				if (!changed) {
+					break;
+				}
+			}
+		} finally {
+			continuousRunActive = false;
+			continuousChangePending = false;
+		}
+	}
+
+	async function waitForContinuousChange(token) {
+		if (token.isCancellationRequested) {
+			return false;
+		}
+		return new Promise((resolve) => {
+			let timer = null;
+			let cancellation = null;
+			const finish = (changed) => {
+				clearTimeout(timer);
+				if (pendingContinuousChange === onChange) {
+					pendingContinuousChange = null;
+				}
+				cancellation?.dispose();
+				resolve(changed);
+			};
+			const onChange = () => {
+				clearTimeout(timer);
+				timer = setTimeout(() => {
+					continuousChangePending = false;
+					finish(true);
+				}, 350);
+			};
+			pendingContinuousChange = onChange;
+			cancellation = token.onCancellationRequested(() => finish(false));
+			if (continuousChangePending) {
+				onChange();
+			}
+		});
+	}
+
+	function notifyContinuousChange() {
+		if (!continuousRunActive) {
+			return;
+		}
+		continuousChangePending = true;
+		activeContinuousRunCancel?.();
+		pendingContinuousChange?.();
+	}
+
+	async function runTestsOnce(request, token, rendered, debugMode = false, repeatCount = 1) {
 		const run = controller.createTestRun(request);
 		const cancelled = { value: false };
 		let activeProcess = null;
 		let activeDebugSession = null;
+		let cancelActiveRunForChange = null;
 		let selections = null;
 		const failedTestIds = new Set();
 		const reportCases = [];
@@ -421,8 +741,21 @@ function activate(context) {
 				void vscode.debug.stopDebugging(activeDebugSession);
 			}
 		});
+		if (continuousRunActive) {
+			cancelActiveRunForChange = () => {
+				if (cancelled.value) {
+					return;
+				}
+				cancelled.value = true;
+				activeProcess?.kill();
+				if (activeDebugSession) {
+					void vscode.debug.stopDebugging(activeDebugSession);
+				}
+			};
+			activeContinuousRunCancel = cancelActiveRunForChange;
+		}
 
-		async function invokeSelection(relativePath, methodName) {
+		async function invokeSelection(relativePath, methodName, innerClassName = "") {
 			if (debugMode) {
 				run.appendOutput(
 					"Starting GUT through Godot Tools. Engine output is available in the Debug Console; cancel the test run to stop it.\r\n"
@@ -432,6 +765,7 @@ function activate(context) {
 					config,
 					relativePath,
 					methodName,
+					innerClassName,
 					(session) => {
 						activeDebugSession = session;
 					},
@@ -447,6 +781,7 @@ function activate(context) {
 				config,
 				relativePath,
 				methodName,
+				innerClassName,
 				rendered,
 				(processHandle) => {
 					activeProcess = processHandle;
@@ -468,14 +803,35 @@ function activate(context) {
 		}
 
 		try {
-			selections = collectSelections(request);
 			config ??= loadGutConfig(root.uri.fsPath);
+			await refreshTests();
+			const filesToResolve = new Set();
+			const requestedItems = request.include?.length
+				? request.include
+				: collectionItems(controller.items);
+			for (const item of requestedItems) {
+				const metadata = testData.get(item.id);
+				const filePath = metadata?.filePath ?? item.uri?.fsPath;
+				if (filePath && isWithin(root.uri.fsPath, filePath)) {
+					const relativePath = path.relative(root.uri.fsPath, filePath)
+						.split(path.sep)
+						.join("/");
+					const fileItem = controller.items.get(`file:${relativePath}`);
+					if (fileItem) {
+						filesToResolve.add(fileItem);
+					}
+				}
+			}
+			for (const fileItem of filesToResolve) {
+				await resolveTestFile(fileItem);
+			}
+			selections = collectSelections(request);
 			if (selections.runAll) {
 				const files = collectionItems(controller.items).filter(
-					(item) => item.children.size > 0
+					(item) => descendantTests(item).length > 0
 				);
 				for (const file of files) {
-					for (const test of collectionItems(file.children)) {
+					for (const test of descendantTests(file)) {
 						run.started(test);
 					}
 				}
@@ -497,7 +853,7 @@ function activate(context) {
 					break;
 				}
 				const fileItem = selection.item;
-				const tests = collectionItems(fileItem.children);
+				const tests = descendantTests(fileItem);
 				for (const test of tests) {
 					run.started(test);
 				}
@@ -506,6 +862,29 @@ function activate(context) {
 					run,
 					result,
 					[fileItem],
+					testData,
+					cancelled.value,
+					failedTestIds,
+					reportCases
+				);
+			}
+
+			for (const selection of selections.suites) {
+				if (cancelled.value) {
+					break;
+				}
+				for (const test of descendantTests(selection.item)) {
+					run.started(test);
+				}
+				const result = await invokeSelection(
+					selection.relativePath,
+					null,
+					selection.innerClassName
+				);
+				reportRunResult(
+					run,
+					result,
+					[selection.item],
 					testData,
 					cancelled.value,
 					failedTestIds,
@@ -522,13 +901,17 @@ function activate(context) {
 				for (let attempt = 1; attempt <= repeatCount && !cancelled.value; attempt += 1) {
 					if (repeatCount > 1) {
 						run.appendOutput(
-							`Attempt ${attempt}/${repeatCount}: ${selection.relativePath}::${selection.methodName}\r\n`,
+							`Attempt ${attempt}/${repeatCount}: ${selection.relativePath}${selection.innerClassName ? `.${selection.innerClassName}` : ""}::${selection.methodName}\r\n`,
 							undefined,
 							selection.item
 						);
 					}
 					attemptResults.push(
-						await invokeSelection(selection.relativePath, selection.methodName)
+						await invokeSelection(
+							selection.relativePath,
+							selection.methodName,
+							selection.innerClassName
+						)
 					);
 				}
 				const result = repeatCount > 1
@@ -551,6 +934,7 @@ function activate(context) {
 				? collectionItems(controller.items)
 				: [
 						...selections.files.map((selection) => selection.item),
+						...selections.suites.map((selection) => selection.item),
 						...selections.tests.map((selection) => selection.item)
 					];
 			for (const item of included) {
@@ -567,9 +951,10 @@ function activate(context) {
 				.filter((metadata) => metadata?.kind === "test")
 				.map((metadata) => ({
 					relativePath: metadata.relativePath,
-					methodName: metadata.methodName
+					methodName: metadata.methodName,
+					innerClassName: metadata.innerClassName ?? ""
 				}));
-			await context.workspaceState.update("godotGutTestProvider.lastFailedRun", {
+			await context.workspaceState.update(projectStateKey, {
 				testIds: lastFailedTestIds,
 				testRefs: lastFailedTestRefs,
 				rendered: runMode.rendered,
@@ -608,7 +993,18 @@ function activate(context) {
 							"Open the project in VS Code and run the listed test with the recorded profile. The command argument arrays use <project-root> as a placeholder. Provider argument values and environment values are intentionally omitted."
 					}
 				: null;
+			if (lastReproductionReport) {
+				reproductionReports.set(rootHash, {
+					rootPath: root.uri.fsPath,
+					report: lastReproductionReport
+				});
+			} else {
+				reproductionReports.delete(rootHash);
+			}
 			cancellation.dispose();
+			if (activeContinuousRunCancel === cancelActiveRunForChange) {
+				activeContinuousRunCancel = null;
+			}
 			run.end();
 		}
 	}
@@ -627,7 +1023,7 @@ function activate(context) {
 							"Dummy"
 						]
 					: [];
-		return [
+		const argumentsList = [
 			"godot",
 			...profileArguments,
 			"--path",
@@ -636,10 +1032,12 @@ function activate(context) {
 			"res://addons/gut/gut_cmdln.gd",
 			"-gconfig=",
 			`-gtest=res://${test.path}`,
-			"-gunit_test_name",
-			test.methodName,
-			"-gexit"
 		];
+		if (test.innerClassName) {
+			argumentsList.push("-ginner_class", test.innerClassName);
+		}
+		argumentsList.push("-gunit_test_name", test.methodName, "-gexit");
+		return argumentsList;
 	}
 
 	function combineAttemptResults(attemptResults) {
@@ -702,7 +1100,7 @@ function activate(context) {
 		const include = request.include;
 		const exclude = request.exclude ?? [];
 		if ((!include || include.length === 0) && exclude.length === 0) {
-			return { runAll: true, files: [], tests: [] };
+			return { runAll: true, files: [], suites: [], tests: [] };
 		}
 
 		const excludedIds = new Set();
@@ -711,6 +1109,7 @@ function activate(context) {
 		}
 
 		const files = new Map();
+		const suites = new Map();
 		const tests = new Map();
 		const requestedItems =
 			include && include.length > 0 ? include : collectionItems(controller.items);
@@ -723,31 +1122,73 @@ function activate(context) {
 				continue;
 			}
 			if (metadata.kind === "file") {
-				const childTests = collectionItems(item.children).filter(
-					(child) => !excludedIds.has(child.id)
-				);
-				if (childTests.length === item.children.size) {
+				const allTests = descendantTests(item);
+				const selectedTests = allTests.filter((child) => !excludedIds.has(child.id));
+				if (selectedTests.length === allTests.length) {
 					files.set(item.id, { item, ...metadata });
 				} else {
-					for (const child of childTests) {
-						const childMetadata = testData.get(child.id);
-						if (childMetadata) {
-							tests.set(child.id, { item: child, ...childMetadata });
-						}
+					for (const child of selectedTests) {
+						addSelectedTest(child, tests);
+					}
+				}
+			} else if (metadata.kind === "suite") {
+				const allTests = descendantTests(item);
+				const selectedTests = allTests.filter((child) => !excludedIds.has(child.id));
+				if (selectedTests.length === allTests.length) {
+					suites.set(item.id, { item, ...metadata });
+				} else {
+					for (const child of selectedTests) {
+						addSelectedTest(child, tests);
 					}
 				}
 			} else {
-				tests.set(item.id, { item, ...metadata });
+				addSelectedTest(item, tests);
 			}
 		}
 
+		for (const [id, selection] of suites) {
+			if (files.has(`file:${selection.relativePath}`)) {
+				suites.delete(id);
+			}
+		}
 		for (const [id, selection] of tests) {
 			const fileId = `file:${selection.relativePath}`;
-			if (files.has(fileId)) {
+			if (
+				files.has(fileId) ||
+				[...suites.values()].some(
+					(suite) =>
+						suite.relativePath === selection.relativePath &&
+						suite.innerClassName === selection.innerClassName
+				)
+			) {
 				tests.delete(id);
 			}
 		}
-		return { runAll: false, files: [...files.values()], tests: [...tests.values()] };
+		return {
+			runAll: false,
+			files: [...files.values()],
+			suites: [...suites.values()],
+			tests: [...tests.values()]
+		};
+	}
+
+	function addSelectedTest(item, tests) {
+		const metadata = testData.get(item.id);
+		if (metadata?.kind === "test") {
+			tests.set(item.id, { item, ...metadata });
+		}
+	}
+
+	function descendantTests(item) {
+		const tests = [];
+		for (const child of collectionItems(item.children)) {
+			if (testData.get(child.id)?.kind === "test") {
+				tests.push(child);
+			} else {
+				tests.push(...descendantTests(child));
+			}
+		}
+		return tests;
 	}
 
 	function addDescendantIds(item, ids) {
@@ -773,12 +1214,13 @@ function activate(context) {
 
 		if (isCancelled) {
 			for (const parent of selectedParents) {
-				if (metadataById.get(parent.id)?.kind === "file") {
-					for (const child of collectionItems(parent.children)) {
-						run.skipped(child);
-					}
-				} else {
-					run.skipped(parent);
+				const metadata = metadataById.get(parent.id);
+				const tests =
+					metadata?.kind === "file" || metadata?.kind === "suite"
+						? descendantTests(parent)
+						: [parent];
+				for (const test of tests) {
+					run.skipped(test);
 				}
 			}
 			return;
@@ -795,13 +1237,13 @@ function activate(context) {
 		for (const parent of selectedParents) {
 			const parentMetadata = metadataById.get(parent.id);
 			const tests =
-				parentMetadata?.kind === "file"
-					? collectionItems(parent.children)
+				parentMetadata?.kind === "file" || parentMetadata?.kind === "suite"
+					? descendantTests(parent)
 					: [parent];
 			for (const test of tests) {
 				const metadata = metadataById.get(test.id);
 				const testResults = metadata
-					? resultsByKey.get(resultKey(metadata.relativePath, metadata.methodName))
+					? resultsByKey.get(resultKey(testClassName(metadata), metadata.methodName))
 					: null;
 				if (!testResults || testResults.length === 0) {
 					reportCases.push({
@@ -812,9 +1254,10 @@ function activate(context) {
 					});
 					run.errored(
 						test,
-						new vscode.TestMessage(
+						makeRunErrorMessage(
 							result.error ??
-								`GUT did not report a result for ${metadata?.methodName ?? test.label}.`
+								`GUT did not report a result for ${metadata?.methodName ?? test.label}.`,
+							metadata
 						)
 					);
 					continue;
@@ -828,7 +1271,7 @@ function activate(context) {
 						status: "errored",
 						attempts: testResult.attemptOutcomes ?? [testResult.status]
 					});
-					run.errored(test, new vscode.TestMessage(result.error));
+					run.errored(test, makeRunErrorMessage(result.error, metadata));
 				} else if (testResult.status === "pending") {
 					reportCases.push({
 						path: metadata?.relativePath ?? "",
@@ -903,6 +1346,24 @@ function activate(context) {
 		}
 	}
 
+	function testClassName(metadata) {
+		return `res://${metadata.relativePath}${
+			metadata.innerClassName ? `.${metadata.innerClassName}` : ""
+		}`;
+	}
+
+	function makeRunErrorMessage(message, metadata) {
+		const testMessage = new vscode.TestMessage(message);
+		const location = failureLocation(message, metadata, root.uri.fsPath);
+		if (location) {
+			testMessage.location = new vscode.Location(
+				vscode.Uri.file(location.filePath),
+				new vscode.Range(location.line - 1, 0, location.line - 1, 0)
+			);
+		}
+		return testMessage;
+	}
+
 	function failureFrames(message, metadata, projectPath) {
 		const text = message ?? "";
 		const frames = [];
@@ -916,8 +1377,12 @@ function activate(context) {
 				: path.isAbsolute(sourcePath)
 					? sourcePath
 					: path.resolve(projectPath, sourcePath);
+			const line = Number(match[2]);
+			if (!Number.isInteger(line) || line < 1 || !isWithin(projectPath, filePath)) {
+				continue;
+			}
 			frames.push({
-				line: Number(match[2]),
+				line,
 				filePath,
 				relativePath: path.relative(projectPath, filePath).split(path.sep).join("/")
 			});
@@ -927,7 +1392,7 @@ function activate(context) {
 		}
 
 		const lineMatch = /\bat line (\d+)\b/i.exec(text);
-		return lineMatch && metadata
+		return lineMatch && metadata && Number(lineMatch[1]) > 0
 			? [
 					{
 						line: Number(lineMatch[1]),
@@ -979,9 +1444,9 @@ function activate(context) {
 		const fileWatcher = vscode.workspace.createFileSystemWatcher(
 			new vscode.RelativePattern(root, "**/*.gd")
 		);
-		fileWatcher.onDidCreate(refreshForTestFile);
-		fileWatcher.onDidChange(refreshForTestFile);
-		fileWatcher.onDidDelete(refreshForTestFile);
+		fileWatcher.onDidCreate((uri) => refreshForTestFile(uri, false));
+		fileWatcher.onDidChange((uri) => refreshForTestFile(uri, false));
+		fileWatcher.onDidDelete((uri) => refreshForTestFile(uri, true));
 
 		const configWatcher = vscode.workspace.createFileSystemWatcher(
 			new vscode.RelativePattern(root, ".gutconfig.json")
@@ -1001,12 +1466,36 @@ function activate(context) {
 	async function onConfigChange() {
 		await refreshTests();
 		setWatchers();
+		notifyContinuousChange();
 	}
 
-	async function refreshForTestFile(uri) {
-		if (isTestFilePath(uri.fsPath)) {
-			await refreshTests();
+	async function refreshForTestFile(uri, deleted) {
+		const filePath = path.resolve(uri.fsPath);
+		if (!isWithin(root.uri.fsPath, filePath)) {
+			return;
 		}
+		if (isTestFilePath(filePath) && isConfiguredTestFile(filePath)) {
+			const relativePath = path.relative(root.uri.fsPath, filePath).split(path.sep).join("/");
+			const fileId = `file:${relativePath}`;
+			const existing = controller.items.get(fileId);
+			if (deleted || !fs.existsSync(filePath)) {
+				if (existing) {
+					removeTestFile(existing);
+				}
+			} else if (existing) {
+				await resolveTestFile(existing, true);
+			} else {
+				addTestFile(filePath);
+			}
+		}
+		notifyContinuousChange();
+	}
+
+	function isConfiguredTestFile(filePath) {
+		return (
+			isWithin(root.uri.fsPath, filePath) &&
+			config?.directories.some((directory) => isWithin(directory, filePath)) === true
+		);
 	}
 
 	function isTestFilePath(filePath) {
@@ -1016,6 +1505,15 @@ function activate(context) {
 		return fileName.startsWith(prefix) && fileName.endsWith(suffix);
 	}
 
+	function fileSignature(filePath) {
+		try {
+			const stat = fs.statSync(filePath);
+			return `${stat.size}:${stat.mtimeMs}`;
+		} catch {
+			return "";
+		}
+	}
+
 	context.subscriptions.push(
 		controller,
 		{ dispose: disposeWatchers },
@@ -1023,6 +1521,7 @@ function activate(context) {
 			if (event.affectsConfiguration("gutTestProvider", root)) {
 				await refreshTests();
 				setWatchers();
+				notifyContinuousChange();
 			}
 		})
 	);
@@ -1034,6 +1533,7 @@ function activate(context) {
 		gutConfig,
 		relativePath,
 		methodName,
+		innerClassName,
 		rendered,
 		setProcess,
 		token,
@@ -1055,6 +1555,9 @@ function activate(context) {
 
 		if (relativePath) {
 			args.push("-gconfig=", `-gtest=res://${relativePath}`);
+			if (innerClassName) {
+				args.push("-ginner_class", innerClassName);
+			}
 			if (methodName) {
 				args.push("-gunit_test_name", methodName);
 			}
@@ -1100,6 +1603,7 @@ function activate(context) {
 		gutConfig,
 		relativePath,
 		methodName,
+		innerClassName,
 		setDebugSession,
 		token,
 		onOutput
@@ -1126,6 +1630,9 @@ function activate(context) {
 
 		if (relativePath) {
 			argumentsList.push("-gconfig=", `-gtest=res://${relativePath}`);
+			if (innerClassName) {
+				argumentsList.push("-ginner_class", innerClassName);
+			}
 			if (methodName) {
 				argumentsList.push("-gunit_test_name", methodName);
 			}
@@ -1462,15 +1969,6 @@ function activate(context) {
 		});
 	}
 
-	function findGodotProject() {
-		for (const folder of vscode.workspace.workspaceFolders ?? []) {
-			if (fs.existsSync(path.join(folder.uri.fsPath, "project.godot"))) {
-				return folder;
-			}
-		}
-		return null;
-	}
-
 	function collectionItems(collection) {
 		const items = [];
 		collection.forEach((item) => items.push(item));
@@ -1495,6 +1993,7 @@ function activate(context) {
 			includeSubdirs: parsed.include_subdirs ?? false,
 			prefix: parsed.prefix ?? "test_",
 			suffix: parsed.suffix ?? ".gd",
+			innerClassPrefix: parsed.inner_class_prefix ?? "Test",
 			timeoutSeconds: providerConfiguration.get("timeoutSeconds", 120),
 			additionalArguments: readAdditionalArguments(providerConfiguration),
 			environment: readEnvironment(providerConfiguration)
@@ -1645,7 +2144,10 @@ function activate(context) {
 	}
 
 	function resultKey(classname, name) {
-		return `${classname}::${name}`;
+		const normalizedClassname = (classname ?? "")
+			.replace(/^res:\/\//, "")
+			.replace(/\\/g, "/");
+		return `${normalizedClassname}::${name}`;
 	}
 
 	function readAttribute(attributes, name) {
@@ -1688,6 +2190,14 @@ function activate(context) {
 	function escapeOutput(output) {
 		return output.replace(/\r?\n/g, "\r\n").replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "");
 	}
+}
+
+function findGodotProjects() {
+	return (vscode.workspace.workspaceFolders ?? []).filter(
+		(folder) =>
+			fs.existsSync(path.join(folder.uri.fsPath, "project.godot")) &&
+			fs.existsSync(path.join(folder.uri.fsPath, "addons", "gut", "gut_cmdln.gd"))
+	);
 }
 
 function deactivate() {}
