@@ -1,9 +1,13 @@
 {
   "name": "godot-gut-test-provider",
   "displayName": "GUT Test Explorer",
-  "description": "Discovers and runs GUT tests in the VS Code Test Explorer.",
-  "version": "0.1.12",
+  "description": "VS Code Test Explorer integration for the third-party Godot Unit Test (GUT) add-on.",
+  "version": "0.1.13",
   "publisher": "retrosteve",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/retrosteve/godot-gut-test-provider.git"
+  },
   "files": [
     "extension.js",
     "package.json"

@@ -3,6 +3,21 @@
 A VS Code Test Explorer provider for Godot projects that use the GUT addon at
 `addons/gut/gut_cmdln.gd`.
 
+## Third-party dependency: GUT
+
+GUT (Godot Unit Test) is a separate, third-party GDScript testing framework
+maintained in the [`bitwes/Gut` repository](https://github.com/bitwes/Gut).
+This extension provides VS Code Test Explorer integration; it does not bundle,
+install, or redistribute GUT. Install and enable GUT in each Godot project
+separately. The provider expects the add-on's command-line entry point at
+`addons/gut/gut_cmdln.gd`.
+
+See the upstream [GUT add-on source](https://github.com/bitwes/Gut/tree/main/addons/gut)
+and its [MIT license](https://github.com/bitwes/Gut/blob/main/addons/gut/LICENSE.md)
+for the add-on's own implementation and terms. GUT's license applies to GUT,
+not to this provider; this provider's package remains separately marked
+`UNLICENSED`.
+
 ## Requirements
 
 - VS Code 1.80 or newer
@@ -39,7 +54,7 @@ particular game project.
 - `gutTestProvider.godotPath`: optional Godot executable path.
 - `gutTestProvider.timeoutSeconds`: maximum duration for a non-debug GUT run.
 - `gutTestProvider.repeatFailedCount`: number of attempts made by **Repeat
-  Failed** (2–20, default 3).
+  Failed** (2-20, default 3).
 - `gutTestProvider.breakOnFailure`: pause the Debug profile at GUT's assertion
   failure handler (enabled by default).
 - `gutTestProvider.breakOnEveryFailure`: keep pausing on every GUT assertion
